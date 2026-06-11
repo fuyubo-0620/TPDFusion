@@ -1,0 +1,122 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from network.Local_expert import LocalExpertGroup as LocalExpert
+from network.Global_Expert import GlobalExpertGroup as GlobalExpert
+from network.Encoder_Decoder import Encoder, Decoder
+from network.Crossmodal_inter import FocusedLinearCrossAttention
+from network.Fusion_Gate import FusionGate
+from network.CLIP_Injector import CLIPTextInjector
+from network.DetHead import YOLOv8DetHead
+
+
+class WaveFusionNet(nn.Module):
+    def __init__(
+        self,
+        base_channels: int = 48,
+        use_text: bool = True,
+        text_proj_dim: int = 512,
+        clip_model: str = "ViT-B/32",
+        use_task_head: bool = True,
+        num_classes: int = 3,
+        det_mid_ch: int = 64,
+        det_num_convs: int = 2,
+        det_reg_max: int = 16,
+        det_strides: tuple = (2, 4, 8),
+    ):
+        super().__init__()
+        self.use_text = use_text
+        self.use_task_head = use_task_head
+
+        self.encoder = Encoder(in_channels=2, base_channels=base_channels)
+
+        self.local_expert_1 = LocalExpert(in_ch=64, out_ch=64)
+        self.global_expert_1 = GlobalExpert(in_ch=64, out_ch=64)
+        self.cross_fuse_1 = FocusedLinearCrossAttention(dim=64, num_heads=4)
+
+        self.local_expert_2 = LocalExpert(in_ch=64, out_ch=96)
+        self.global_expert_2 = GlobalExpert(in_ch=64, out_ch=96)
+        self.cross_fuse_2 = FocusedLinearCrossAttention(dim=96, num_heads=4)
+
+        self.local_expert_3 = LocalExpert(in_ch=96, out_ch=64)
+        self.global_expert_3 = GlobalExpert(in_ch=96, out_ch=64)
+
+        self.fusion_gate = FusionGate(
+            feat_ch=64,
+            num_blocks=3,
+            text_feat_dim=text_proj_dim,
+            use_text=use_text,
+        )
+
+        self.decoder = Decoder(
+            deep_ch=64,
+            skip_channels=(64, 48, 48),
+            base_channels=base_channels,
+            text_feat_dim=text_proj_dim,
+            use_text=use_text,
+        )
+
+        if use_text:
+            self.text_injector = CLIPTextInjector(
+                proj_dim=text_proj_dim,
+                clip_model=clip_model,
+            )
+
+        if use_task_head:
+            self.det_head = YOLOv8DetHead(
+                in_channels_list=[base_channels, 64, 64],
+                mid_ch=det_mid_ch,
+                num_classes=num_classes,
+                num_convs=det_num_convs,
+                reg_max=det_reg_max,
+                strides=det_strides,
+            )
+
+    def forward(
+        self,
+        vis: torch.Tensor,
+        ir: torch.Tensor,
+        texts: list = None,
+        output_det: bool = True,
+    ):
+        device = vis.device
+
+        text_feat = None
+        if self.use_text and texts is not None:
+            text_feat = self.text_injector(texts, device)
+
+        enc_skip_0, enc_skip_1, enc_skip_2, feat_down = self.encoder(vis, ir)
+
+        local_1 = self.local_expert_1(feat_down)
+        global_1 = self.global_expert_1(feat_down)
+        local_1, global_1 = self.cross_fuse_1(local_1, global_1)
+
+        local_2 = self.local_expert_2(local_1)
+        global_2 = self.global_expert_2(global_1)
+        local_2, global_2 = self.cross_fuse_2(local_2, global_2)
+
+        local_3 = self.local_expert_3(local_2)
+        global_3 = self.global_expert_3(global_2)
+
+        deep_feat, feat_vec = self.fusion_gate(
+            local_3, global_3, text_feat=text_feat,
+        )
+
+        det_out = None
+        if self.use_task_head and output_det:
+            det_features = [enc_skip_1, enc_skip_2, deep_feat]
+            det_out = self.det_head(det_features)
+
+        fused = self.decoder(
+            deep_feat=deep_feat,
+            enc_skip_2=enc_skip_2,
+            enc_skip_1=enc_skip_1,
+            enc_skip_0=enc_skip_0,
+            text_feat=text_feat,
+        )
+
+        if self.use_text and feat_vec is not None:
+            return fused, feat_vec, text_feat, det_out
+        else:
+            return fused, None, None, det_out
